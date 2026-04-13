@@ -1,0 +1,11 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+PORT="8799"
+SERVER="$HOME/bin/animagine_tags_server.py"
+
+if ! lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  python3 "$SERVER" >/tmp/animagine-tags.log 2>&1 &
+fi
+
+open "http://127.0.0.1:$PORT/index.html"
