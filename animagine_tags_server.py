@@ -87,14 +87,81 @@ class Handler(SimpleHTTPRequestHandler):
                 return asset["id"]
         return None
 
+    def _refresh_assets(self, roots, wait):
+        payload = {"roots": roots}
+        qs = "?wait=true" if wait else ""
+        req = urllib.request.Request(
+            f"{COMFY}/api/assets/seed{qs}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+
+    def _find_history_prompt_ids_by_filename(self, filename, max_items=2000):
+        encoded = urllib.parse.urlencode({"max_items": max_items})
+        with urllib.request.urlopen(f"{COMFY}/history?{encoded}", timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+
+        prompt_ids = []
+        if not isinstance(data, dict):
+            return prompt_ids
+
+        for prompt_id, item in data.items():
+            outputs = (item or {}).get("outputs", {})
+            found = False
+            for node_output in outputs.values():
+                for image in node_output.get("images", []):
+                    if image.get("filename") == filename:
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                prompt_ids.append(prompt_id)
+        return prompt_ids
+
+    def _delete_history_prompt_ids(self, prompt_ids):
+        if not prompt_ids:
+            return 0
+        payload = {"delete": prompt_ids}
+        req = urllib.request.Request(
+            f"{COMFY}/history",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20):
+            pass
+        return len(prompt_ids)
+
     def do_DELETE(self):
         # DELETE /api/assets/<filename>?delete_content=true
-        if not self.path.startswith("/api/assets/"):
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+
+        if not route.startswith("/api/assets/"):
             self._json(404, {"error": "not found"})
             return
 
-        filename = urllib.parse.unquote(self.path[len("/api/assets/"):].split("?")[0])
-        delete_content = "delete_content=true" in self.path
+        filename = urllib.parse.unquote(route[len("/api/assets/"):])
+        query = urllib.parse.parse_qs(parsed.query)
+        delete_content = str(query.get("delete_content", ["false"])[0]).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        purge_history = str(query.get("purge_history", ["true"])[0]).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        refresh_assets = str(query.get("refresh_assets", ["true"])[0]).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
 
         try:
             asset_id = self._find_asset_id_by_name(filename)
@@ -118,12 +185,85 @@ class Handler(SimpleHTTPRequestHandler):
             status = e.code
 
         if status == 204:
-            self._json(200, {"deleted": True, "id": asset_id, "name": filename})
+            history_deleted = 0
+            history_error = None
+            if purge_history:
+                try:
+                    prompt_ids = self._find_history_prompt_ids_by_filename(filename)
+                    history_deleted = self._delete_history_prompt_ids(prompt_ids)
+                except Exception as e:
+                    history_error = str(e)
+
+            refresh_error = None
+            refresh_result = None
+            if refresh_assets:
+                try:
+                    _, refresh_result = self._refresh_assets(["output"], True)
+                except Exception as e:
+                    refresh_error = str(e)
+
+            response = {
+                "deleted": True,
+                "id": asset_id,
+                "name": filename,
+                "history_deleted": history_deleted,
+                "assets_refreshed": bool(refresh_assets and refresh_error is None),
+            }
+            if refresh_result is not None:
+                response["refresh_result"] = refresh_result
+            if history_error:
+                response["history_error"] = history_error
+            if refresh_error:
+                response["refresh_error"] = refresh_error
+            self._json(200, response)
         else:
             self._json(status, {"error": f"ComfyUI returned {status}", "id": asset_id})
 
     def do_POST(self):
-        if self.path != "/api/generate":
+        parsed = urllib.parse.urlparse(self.path)
+        route = parsed.path
+
+        if route == "/api/assets/refresh":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length) if length > 0 else b""
+                req = json.loads(raw.decode("utf-8")) if raw else {}
+
+                roots = req.get("roots", ["output"])
+                if not isinstance(roots, list):
+                    self._json(400, {"error": "roots must be a list"})
+                    return
+                roots = [r for r in roots if r in {"models", "input", "output"}]
+                if not roots:
+                    roots = ["output"]
+
+                wait = req.get("wait", True)
+                wait = bool(wait)
+
+                status, result = self._refresh_assets(roots, wait)
+                self._json(
+                    status,
+                    {
+                        "ok": status in (200, 202),
+                        "comfy_status": status,
+                        "roots": roots,
+                        "result": result,
+                    },
+                )
+                return
+            except urllib.error.HTTPError as e:
+                details = ""
+                try:
+                    details = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                self._json(502, {"error": f"ComfyUI refresh failed ({e.code})", "details": details})
+                return
+            except Exception as e:
+                self._json(500, {"error": str(e)})
+                return
+
+        if route != "/api/generate":
             self._json(404, {"error": "not found"})
             return
 
